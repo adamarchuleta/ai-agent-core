@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Literal
 
@@ -11,6 +12,8 @@ from pydantic import BaseModel, Field
 APP_TITLE = "AI Agent Core"
 MEMORY_API_BASE = os.getenv("MEMORY_API_BASE", "http://127.0.0.1:8000")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 app = FastAPI(title=APP_TITLE)
@@ -56,7 +59,7 @@ def normalize_topic(value: str | None, fallback_text: str) -> str:
     return "general"
 
 
-def classify_intent(message: str) -> tuple[Literal["save_memory", "search_memory", "chat"], str]:
+def classify_intent_fallback(message: str) -> tuple[Literal["save_memory", "search_memory", "chat"], str]:
     lowered = message.lower().strip()
 
     save_patterns = [
@@ -82,15 +85,78 @@ def classify_intent(message: str) -> tuple[Literal["save_memory", "search_memory
     ]
 
     if any(pattern in lowered for pattern in save_patterns):
-        return "save_memory", "The message looks like a durable fact or preference worth storing."
+        return "save_memory", "Fallback classifier: the message looks like a durable fact or preference worth storing."
 
     if any(pattern in lowered for pattern in search_patterns):
-        return "search_memory", "The message appears to be asking for previously stored information."
+        return "search_memory", "Fallback classifier: the message appears to be asking for previously stored information."
 
     if lowered.endswith("?"):
-        return "search_memory", "The message is phrased as a question, so memory lookup is worth trying first."
+        return "search_memory", "Fallback classifier: the message is phrased as a question, so memory lookup is worth trying first."
 
-    return "chat", "No explicit save or search signal was detected."
+    return "chat", "Fallback classifier: no explicit save or search signal was detected."
+
+
+async def classify_intent_with_llm(
+    message: str,
+    topic: str,
+) -> tuple[Literal["save_memory", "search_memory", "chat"], str, str]:
+    if not OPENAI_API_KEY:
+        intent, reason = classify_intent_fallback(message)
+        return intent, reason, topic
+
+    system_prompt = (
+        "You are an intent router for an AI agent. "
+        "Classify the user's message into exactly one of these intents: "
+        "save_memory, search_memory, or chat. "
+        "Return strict JSON only with keys: intent, reason, topic. "
+        "The topic should be short, lowercase, and hyphenated when needed. "
+        "Choose save_memory when the user states a durable preference, fact, or detail worth remembering. "
+        "Choose search_memory when the user asks for previously stored information or personal context. "
+        "Choose chat for everything else."
+    )
+
+    user_prompt = (
+        f"Message: {message}\n"
+        f"Current topic guess: {topic}\n\n"
+        "Return JSON like: "
+        '{"intent":"save_memory","reason":"...","topic":"preferences"}'
+    )
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_MODEL,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    content = data["choices"][0]["message"]["content"]
+
+    try:
+        parsed = json.loads(content)
+        intent = parsed.get("intent", "chat")
+        reason = parsed.get("reason", "The model returned a routing decision.")
+        parsed_topic = normalize_topic(parsed.get("topic"), fallback_text=message)
+
+        if intent not in {"save_memory", "search_memory", "chat"}:
+            raise ValueError("Invalid intent returned by model")
+
+        return intent, reason, parsed_topic
+    except Exception:
+        fallback_intent, fallback_reason = classify_intent_fallback(message)
+        return fallback_intent, fallback_reason, topic
 
 
 async def save_memory(user_id: str, message: str, topic: str) -> dict[str, Any]:
@@ -143,8 +209,8 @@ def health() -> dict[str, str]:
 
 @app.post("/agent/respond", response_model=AgentResponse)
 async def agent_respond(payload: AgentRequest) -> AgentResponse:
-    topic = normalize_topic(payload.topic, payload.message)
-    intent, reason = classify_intent(payload.message)
+    initial_topic = normalize_topic(payload.topic, payload.message)
+    intent, reason, topic = await classify_intent_with_llm(payload.message, initial_topic)
     decision = AgentDecision(intent=intent, reason=reason, topic=topic)
 
     if intent == "save_memory":
