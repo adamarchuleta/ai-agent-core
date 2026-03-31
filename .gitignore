@@ -1,1 +1,11 @@
+# Runtime files
+*.log
+*.pid
+
+# Python
+__pycache__/
+venv/
+
+# Node
+node_modules/
 .env
